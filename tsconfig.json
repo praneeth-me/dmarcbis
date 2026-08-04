@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+
+    /* We ship raw .ts and run it straight through Node's built-in type
+     * stripping (Node 22.6+) instead of compiling to a dist/ directory —
+     * see README "Why no build step". That means source files import each
+     * other with a literal ".ts" extension, which `tsc` normally rejects
+     * unless emit is off. */
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "demo/**/*.ts"]
+}
