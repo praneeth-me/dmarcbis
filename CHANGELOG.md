@@ -30,3 +30,24 @@ Initial version.
   variation.
 - `npm run demo` — prints diagnostics for a handful of real-world-shaped
   records, including a legacy RFC 7489-style record.
+
+## Unreleased
+
+### Added
+
+- MIT `LICENSE`, `CONTRIBUTING.md` and `SECURITY.md`.
+- GitHub Actions CI running the type check and test suite on Node 22.6 (the
+  declared minimum, and the first version with native TypeScript type
+  stripping) and Node 24.
+- `repository`, `homepage`, `bugs`, `author` and `files` metadata in
+  `package.json`.
+
+### Known before a first npm release
+
+`main`, `types` and `exports` currently point at TypeScript source. That works
+for this repo's own tests and for bundlers that compile TypeScript (which is
+how praneeth.me consumes it), but it will break consumers on older Node, on
+CommonJS, or on any toolchain that expects a package to ship JavaScript.
+Publishing to npm needs a build emitting `.js` plus `.d.ts` and `exports`
+repointed at it. `private: true` stays set until that is done — `npm publish`
+refuses while it is, which is deliberate.

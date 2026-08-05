@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.6 is the floor declared in package.json's engines — it is the
+        # first version with native TypeScript type stripping, which is what
+        # lets the tests run the source with no build step. Testing the floor
+        # and current means a change that quietly needs something newer fails
+        # here rather than in someone else's project.
+        node: ["22.6", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

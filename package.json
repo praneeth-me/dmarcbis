@@ -2,13 +2,34 @@
   "name": "dmarcbis",
   "version": "0.1.0",
   "description": "A parser and validator for DMARC records, checked against RFC 9989 (DMARCbis) instead of the RFC 7489 every other DMARC checker still assumes.",
-  "keywords": ["dmarc", "dmarcbis", "rfc9989", "dns", "email-security"],
+  "keywords": [
+    "dmarc",
+    "dmarcbis",
+    "rfc9989",
+    "dns",
+    "email-security"
+  ],
   "license": "MIT",
+  "author": "Praneeth Akkaraju (https://praneeth.me)",
+  "homepage": "https://github.com/praneeth-me/dmarcbis#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/praneeth-me/dmarcbis.git"
+  },
+  "bugs": {
+    "url": "https://github.com/praneeth-me/dmarcbis/issues"
+  },
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=22.6.0"
   },
+  "files": [
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
