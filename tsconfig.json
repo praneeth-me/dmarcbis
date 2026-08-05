@@ -4,6 +4,10 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "lib": ["ES2023"],
+    /* Node globals only — no "dom". Nothing here touches a browser, and
+     * leaving the DOM lib out means an accidental `document` or `fetch`
+     * in library code fails to compile rather than shipping. */
+    "types": ["node"],
 
     "strict": true,
     "noUncheckedIndexedAccess": true,
