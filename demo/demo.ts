@@ -39,6 +39,12 @@ const samples: SampleRecord[] = [
     record: '  V = DMARC1 ;P=reject;  P=none ;RUA=mailto:dmarc@example.com ;  ',
   },
   {
+    title: "A reject policy in testing mode",
+    description:
+      "t=y is what replaced pct= for staged rollouts, and its effect is easy to misread: it applies the policy one level DOWN, so this record quarantines rather than rejects. 'Testing' does not mean 'nothing happens' — that's only true at p=quarantine.",
+    record: "v=DMARC1; p=reject; t=y; np=reject; rua=mailto:dmarc@example.com",
+  },
+  {
     title: "Not a DMARC record at all",
     description: "What happens when the input isn't a DMARC record — no crash, just diagnostics explaining why.",
     record: "the quick brown fox jumps over the lazy dog",

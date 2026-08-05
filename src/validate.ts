@@ -250,7 +250,28 @@ function validateBooleanAndPsdTags(parsed: ParsedRecord, diagnostics: Diagnostic
       code: "invalid-t-value",
       severity: "error",
       tag: "t",
-      message: `t="${t}" isn't valid — must be "y" or "n". t=y is RFC 9989's replacement for the old pct=<N> partial rollout: it marks the whole policy as a test, rather than enforcing it against a percentage of mail.`,
+      message: `t="${t}" isn't valid — must be "y" or "n". t=y is RFC 9989's replacement for the old pct=<N> partial rollout: instead of enforcing against a percentage of mail, it asks receivers to apply the policy one level below the one you published.`,
+    });
+  } else if (t?.toLowerCase() === "y") {
+    // RFC 9989 §4.7 defines t=y as a *downgrade by one level*, not as a
+    // suspension of the policy. That distinction is easy to get wrong — the
+    // intuitive reading is "testing means nothing happens", which is only
+    // true at p=quarantine. At p=reject, t=y still quarantines. Since t= is
+    // the replacement for pct= and everyone's muscle memory is the old
+    // percentage ramp, spell the actual effect out rather than assuming the
+    // reader infers it.
+    const policy = parsed.tags["p"]?.toLowerCase();
+    const effect =
+      policy === "reject"
+        ? `you published p=reject, so failing mail is being quarantined, not rejected`
+        : policy === "quarantine"
+          ? `you published p=quarantine, so failing mail is being treated as p=none — nothing is happening to it yet`
+          : `it applies one level below whatever p= says (reject becomes quarantine; quarantine becomes none). At p=none there is no lower level, so it changes nothing`;
+    diagnostics.push({
+      code: "t-testing-mode",
+      severity: "info",
+      tag: "t",
+      message: `t=y puts this record in testing mode: receivers apply the policy one level below the one published — ${effect}. Reports still arrive as though the full policy were in force, which is the point: you see the impact before taking it. Drop t=y when you want the published policy to actually apply.`,
     });
   }
 

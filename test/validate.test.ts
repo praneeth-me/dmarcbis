@@ -20,6 +20,11 @@ interface ValidateCase {
    * separate "removed-tag" findings for pct/rf/ri) — checked by exact
    * count rather than `mustInclude`'s "at least one" test. */
   mustIncludeCounts?: Record<string, number>;
+  /** Asserts a diagnostic's *wording*, not just its presence. Reserved for
+   * messages whose specific claim is the point — e.g. t=y at p=reject has to
+   * say mail is quarantined, because "this is a test" would be true-sounding
+   * and wrong. Keep the patterns loose enough to survive rephrasing. */
+  mustMatch?: Record<string, RegExp>;
 }
 
 const cases: ValidateCase[] = [
@@ -79,15 +84,39 @@ const cases: ValidateCase[] = [
 
   // --- new tags (RFC 9989) ---
   {
-    name: "t=y parses and validates cleanly",
+    name: "t=y parses cleanly and explains the downgrade",
     record: "v=DMARC1; p=reject; t=y",
-    mustInclude: [],
+    mustInclude: ["t-testing-mode"],
     mustExclude: ["invalid-t-value"],
+  },
+  {
+    // RFC 9989 §4.7: t=y applies the policy one level DOWN, so p=reject with
+    // t=y quarantines rather than rejecting. The common misreading is that
+    // t=y suspends the policy entirely — which is only true at p=quarantine.
+    // Assert the reject case names quarantine specifically, so the message
+    // can't regress back to a vague "this is a test" wording.
+    name: "t=y at p=reject says failing mail is quarantined, not rejected",
+    record: "v=DMARC1; p=reject; t=y",
+    mustInclude: ["t-testing-mode"],
+    mustMatch: { "t-testing-mode": /quarantin/i },
+  },
+  {
+    name: "t=y at p=quarantine says failing mail is treated as none",
+    record: "v=DMARC1; p=quarantine; t=y",
+    mustInclude: ["t-testing-mode"],
+    mustMatch: { "t-testing-mode": /p=none|as p=none|nothing is happening/i },
+  },
+  {
+    name: "t=n does not raise the testing-mode note",
+    record: "v=DMARC1; p=reject; t=n",
+    mustInclude: [],
+    mustExclude: ["t-testing-mode", "invalid-t-value"],
   },
   {
     name: "t= with an invalid value is flagged",
     record: "v=DMARC1; p=reject; t=maybe",
     mustInclude: ["invalid-t-value"],
+    mustExclude: ["t-testing-mode"],
   },
   {
     name: "np=quarantine validates cleanly, without the reject-only notes",
@@ -248,6 +277,16 @@ test("validate()", async (t) => {
           actualCount,
           expectedCount,
           `expected "${code}" to appear ${expectedCount} time(s), found ${actualCount} in [${codes.join(", ")}]`,
+        );
+      }
+      for (const [code, pattern] of Object.entries(testCase.mustMatch ?? {})) {
+        const matched = diagnostics.filter((diagnostic) => diagnostic.code === code);
+        assert.ok(matched.length > 0, `expected "${code}" in [${codes.join(", ")}]`);
+        assert.ok(
+          matched.some((diagnostic) => pattern.test(diagnostic.message)),
+          `expected "${code}" message to match ${pattern}, got: ${matched
+            .map((diagnostic) => diagnostic.message)
+            .join(" | ")}`,
         );
       }
     });
