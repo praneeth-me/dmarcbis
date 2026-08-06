@@ -5,16 +5,28 @@
  */
 
 /**
- * error   — the record is broken in a way that changes how a receiver
- *            treats it (an ignored record, a rejected tag, etc).
- * warning — the record works, but probably not as the operator intended
- *            (a removed tag that's now silently ignored, a tag that
- *            defaults to something looser than expected).
- * info    — worth knowing, not a defect (a privacy note, a DNSSEC caveat,
- *            confirmation that a risky-looking setting is actually fine).
+ * The levels are drawn along the line RFC 9989 itself draws, which is not
+ * the line "how wrong does this look":
  *
- * Three levels, not a boolean, because "should I fix this" and "is this
- * broken" are different questions — see the module doc in validate.ts.
+ * error   — the policy the operator published is not the policy in force.
+ *            Either the whole record is disregarded (a missing, misplaced
+ *            or misspelt v=), or §4.10.1's fallback has been triggered by
+ *            an absent/invalid p=, sp= or np= and enforcement has silently
+ *            collapsed to p=none — or to no DMARC processing at all.
+ * warning — the record stands and its policy applies, but some part of it
+ *            isn't doing what it appears to. §4.8 requires receivers to
+ *            discard a syntax error "in favor of default values (if any)
+ *            or ignored outright", so a malformed tag doesn't invalidate
+ *            anything; it just quietly reverts to a default, which for the
+ *            alignment tags is the *looser* of the two options.
+ * info    — worth knowing, not a defect (a privacy note, a DNSSEC caveat,
+ *            confirmation that a risky-looking setting is actually fine,
+ *            a reporting URI most receivers will skip).
+ *
+ * The distinction that matters most: `error` means "your enforcement is
+ * not running", and nothing else earns it. A junk segment in the middle of
+ * an otherwise good record is a warning, because a receiver steps over it
+ * and applies your p=reject exactly as written.
  */
 export type Severity = "error" | "warning" | "info";
 

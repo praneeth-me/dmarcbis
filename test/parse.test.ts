@@ -122,7 +122,11 @@ test("parse()", async (t) => {
   for (const testCase of cases) {
     await t.test(testCase.name, () => {
       const result = parse(testCase.input);
-      assert.deepEqual(result.tags, testCase.expectedTags);
+      // Spread into a plain object before comparing: `tags` has a null
+      // prototype (see parse.ts) and deepEqual under node:assert/strict
+      // compares prototypes, so a direct comparison against an object
+      // literal fails on that alone.
+      assert.deepEqual({ ...result.tags }, testCase.expectedTags);
       assert.deepEqual(
         result.issues.map((issue) => issue.code),
         testCase.expectedIssueCodes,
@@ -152,4 +156,47 @@ test("parse() reports input and normalized separately for dig-style quoting", ()
   const result = parse(raw);
   assert.equal(result.input, raw);
   assert.equal(result.normalized, "v=DMARC1; p=reject");
+});
+
+test("parse().tags has a null prototype — no inherited members leak through", () => {
+  const result = parse("v=DMARC1; p=none");
+  // A plain-object `tags` returns Object.prototype's members for a lookup
+  // of e.g. "constructor" or "toString", so a consumer checking
+  // `tags[name] !== undefined` for a caller-supplied name gets a false
+  // positive. There is nothing to inherit from a null-prototype object.
+  assert.equal(Object.getPrototypeOf(result.tags), null);
+  assert.equal(result.tags["constructor"], undefined);
+  assert.equal(result.tags["toString"], undefined);
+});
+
+test("parse() records a tag literally named `constructor` like any other", () => {
+  const result = parse("v=DMARC1; constructor=x");
+  assert.equal(result.tags["constructor"], "x");
+  assert.ok(result.entries.some((entry) => entry.name === "constructor"));
+});
+
+test("parse() never throws on randomly malformed input", () => {
+  // Deterministic PRNG so a failure is reproducible from the seed rather
+  // than being a heisenbug that vanishes on re-run.
+  let seed = 0x9e3779b9;
+  const random = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 0x100000000;
+  };
+  const alphabet = 'vpDMARC1=; \t"\\:,!@.<>&%_-\u00a0\u201c0123456789';
+
+  for (let iteration = 0; iteration < 5000; iteration += 1) {
+    const length = Math.floor(random() * 120);
+    let input = "";
+    for (let i = 0; i < length; i += 1) {
+      input += alphabet[Math.floor(random() * alphabet.length)];
+    }
+    const result = parse(input);
+    assert.ok(Array.isArray(result.issues), `issues missing for input: ${JSON.stringify(input)}`);
+    for (const issue of result.issues) {
+      assert.ok(typeof issue.code === "string" && issue.code.length > 0);
+      assert.ok(["error", "warning", "info"].includes(issue.severity));
+      assert.ok(typeof issue.message === "string" && issue.message.length > 0);
+    }
+  }
 });

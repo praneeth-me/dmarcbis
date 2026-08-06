@@ -104,7 +104,7 @@ const cases: ValidateCase[] = [
     name: "t=y at p=quarantine says failing mail is treated as none",
     record: "v=DMARC1; p=quarantine; t=y",
     mustInclude: ["t-testing-mode"],
-    mustMatch: { "t-testing-mode": /p=none|as p=none|nothing is happening/i },
+    mustMatch: { "t-testing-mode": /p=quarantine is being applied as none/i },
   },
   {
     name: "t=n does not raise the testing-mode note",
@@ -249,6 +249,132 @@ const cases: ValidateCase[] = [
   {
     name: "an unrecognized tag is noted but not treated as an error",
     record: "v=DMARC1; p=reject; foo=bar",
+    mustInclude: ["unrecognized-tag"],
+  },
+
+  // --- RFC 9989 §4.10.1: a broken policy tag collapses the whole record ---
+  // These are the rows that matter most in the whole suite. An invalid sp=
+  // does not disable sp=; it discards the record's enforcement entirely.
+  // Reporting that as a tag-scoped error told operators the opposite of the
+  // truth, which is worse than not reporting it.
+  {
+    name: "invalid sp= collapses the record's policy, not just sp=",
+    record: "v=DMARC1; p=reject; sp=rejct; rua=mailto:d@example.com",
+    mustInclude: ["invalid-sp-value"],
+    mustMatch: {
+      "invalid-sp-value": /entire record.*[\s\S]*as though it said p=none|as though it said p=none/i,
+    },
+  },
+  {
+    name: "invalid np= with no usable rua means no DMARC processing at all",
+    record: "v=DMARC1; p=reject; np=rejct",
+    mustInclude: ["invalid-np-value"],
+    mustMatch: { "invalid-np-value": /no DMARC processing/i },
+  },
+  {
+    name: "missing p= with a usable rua falls back to p=none, not to nothing",
+    record: "v=DMARC1; rua=mailto:dmarc@example.com",
+    mustInclude: ["missing-policy"],
+    mustMatch: { "missing-policy": /as though it said p=none/i },
+  },
+  {
+    name: "missing p= with no rua switches DMARC off for the domain",
+    record: "v=DMARC1; adkim=s",
+    mustInclude: ["missing-policy"],
+    mustMatch: { "missing-policy": /no DMARC processing/i },
+  },
+
+  // --- RFC 9989 §4.8: syntax errors are discarded, the record survives ---
+  {
+    name: "a junk segment does not invalidate an otherwise good p=reject",
+    record: "v=DMARC1; p=reject; junkchunk; rua=mailto:d@example.com",
+    mustInclude: ["malformed-chunk"],
+    mustMatch: { "malformed-chunk": /doesn't invalidate the record|still processed/i },
+  },
+  {
+    name: "an invalid adkim= falls back to relaxed — the looser setting",
+    record: "v=DMARC1; p=reject; adkim=strict",
+    mustInclude: ["invalid-adkim-value"],
+    mustMatch: { "invalid-adkim-value": /relaxed.*looser|looser/i },
+  },
+  {
+    name: "a tag with no value at all is a syntax error, not an empty value",
+    record: "v=DMARC1; p=reject; adkim=",
+    mustInclude: ["empty-tag-value"],
+    mustExclude: ["invalid-adkim-value"],
+  },
+  {
+    name: "a smart quote substituted into a value is caught",
+    record: "v=DMARC1; p=reject; rua=mailto:“d@example.com”",
+    mustInclude: ["invalid-value-characters"],
+  },
+
+  // --- Reporting URIs: RFC 9989 permits any valid URI, not a scheme list ---
+  {
+    name: "an exotic but valid URI scheme is informational, not an error",
+    record: "v=DMARC1; p=none; rua=ftp://reports.example.com/dmarc",
+    mustInclude: ["unsupported-report-uri-scheme"],
+    mustExclude: ["invalid-report-uri"],
+  },
+  {
+    name: "https: and mailto: are both accepted silently",
+    record: "v=DMARC1; p=none; rua=mailto:d@example.com,https://r.example.com/d",
+    mustInclude: [],
+    mustExclude: ["invalid-report-uri", "unsupported-report-uri-scheme"],
+  },
+  {
+    name: "a bare address with no scheme is genuinely malformed",
+    record: "v=DMARC1; p=none; rua=dmarc@example.com",
+    mustInclude: ["invalid-report-uri"],
+  },
+  {
+    name: "the !size suffix is obsolete syntax that no longer does anything",
+    record: "v=DMARC1; p=none; rua=mailto:d@example.com!10m",
+    mustInclude: ["obsolete-report-size-limit"],
+    mustExclude: ["invalid-report-uri"],
+    mustMatch: { "obsolete-report-size-limit": /obsolete|obs-dmarc-report-size/i },
+  },
+
+  // --- fo: inert without ruf, and d/s may each appear only once ---
+  {
+    name: "fo= without ruf= is silently ignored by receivers",
+    record: "v=DMARC1; p=none; fo=1",
+    mustInclude: ["fo-without-ruf"],
+  },
+  {
+    name: "fo= alongside ruf= draws no fo-without-ruf finding",
+    record: "v=DMARC1; p=none; ruf=mailto:f@example.com; fo=1",
+    mustInclude: [],
+    mustExclude: ["fo-without-ruf"],
+  },
+  {
+    name: "a repeated dmarc-afrf token is invalid per the ABNF comment",
+    record: "v=DMARC1; p=none; ruf=mailto:f@example.com; fo=d:d",
+    mustInclude: ["invalid-fo-value"],
+  },
+
+  // --- t= applies to p, sp and np — not p alone ---
+  {
+    name: "t=y downgrades sp= even when p= is none",
+    record: "v=DMARC1; p=none; sp=reject; t=y",
+    mustInclude: ["t-testing-mode"],
+    mustMatch: { "t-testing-mode": /sp=reject is being applied as quarantine/i },
+  },
+
+  // --- PSD ---
+  {
+    name: "psd=y must not publish ruf= (RFC 9989 §10.2)",
+    record: "v=DMARC1; p=reject; psd=y; ruf=mailto:f@example.com",
+    mustInclude: ["psd-ruf-prohibited"],
+  },
+
+  // --- Prototype-chain regression ---
+  // `constructor` is the only Object.prototype member reachable through the
+  // lower-cased 1*ALPHA tag grammar. It used to be swallowed by an `in`
+  // check against a plain object and produce no diagnostic whatsoever.
+  {
+    name: "a tag named `constructor` is reported like any other unknown tag",
+    record: "v=DMARC1; p=none; constructor=x",
     mustInclude: ["unrecognized-tag"],
   },
 ];

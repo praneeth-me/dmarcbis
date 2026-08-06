@@ -24,6 +24,36 @@ import type { Diagnostic, ParsedRecord, ParsedTagEntry } from "./types.ts";
 const TAG_NAME_PATTERN = /^[A-Za-z]+$/;
 
 /**
+ * dmarc-value = %x20-3A / %x3C-7E — printable US-ASCII except ";" (0x3B),
+ * which is the separator. That excludes control characters and everything
+ * non-ASCII, so a value carrying a smart quote or a non-breaking space
+ * (both of which a word processor or a wiki will happily substitute into a
+ * record someone is drafting) is a syntax error, not a curiosity. Those
+ * substitutions are invisible in most DNS UIs, which is exactly why this
+ * is worth reporting rather than silently tolerating.
+ */
+const VALUE_CHARACTER_PATTERN = /^[\x20-\x3A\x3C-\x7E]*$/;
+
+/** Describes an out-of-range character precisely enough to find it in a
+ * zone file, where it is likely to be visually indistinguishable from the
+ * ASCII character it replaced. */
+function describeInvalidCharacters(value: string): string {
+  const seen = new Map<string, number>();
+  for (const character of value) {
+    if (VALUE_CHARACTER_PATTERN.test(character)) continue;
+    seen.set(character, (seen.get(character) ?? 0) + 1);
+  }
+  return [...seen.keys()]
+    .slice(0, 5)
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      const hex = codePoint.toString(16).toUpperCase().padStart(4, "0");
+      return `U+${hex}`;
+    })
+    .join(", ");
+}
+
+/**
  * `dig`, `nslookup` and every DNS zone file quote a TXT record's value, and
  * a value over 255 bytes gets split across *multiple* quoted
  * <character-string>s that concatenate into one logical value with no
@@ -81,7 +111,15 @@ export function parse(record: string): ParsedRecord {
   }
 
   const entries: ParsedTagEntry[] = [];
-  const tags: Record<string, string> = {};
+  // Null-prototype, so a tag literally named "constructor" (or any other
+  // Object.prototype member) is an ordinary key rather than a collision
+  // with an inherited one. Tag names are lower-cased below, which makes
+  // "constructor" the only such collision that can actually occur — every
+  // other Object.prototype member is camelCase or underscore-prefixed and
+  // so unreachable through 1*ALPHA. One name is still one too many: a
+  // consumer reading `tags[someName]` on a plain object gets an inherited
+  // function back instead of `undefined`.
+  const tags: Record<string, string> = Object.create(null) as Record<string, string>;
   const seenNames = new Set<string>();
   const duplicateNames = new Set<string>();
 
@@ -99,9 +137,9 @@ export function parse(record: string): ParsedRecord {
       if (!isTrailingSeparator) {
         issues.push({
           code: "empty-segment",
-          severity: "error",
+          severity: "warning",
           tag: null,
-          message: `Found an empty segment between semicolons (position ${index + 1} of the ";"-separated record) — likely a stray double semicolon.`,
+          message: `Found an empty segment between semicolons (position ${index + 1} of the ";"-separated record) — likely a stray double semicolon. RFC 9989 §4.8 has receivers discard a syntax error like this and carry on with the rest of the record, so it's untidy rather than fatal.`,
         });
       }
       return;
@@ -111,9 +149,9 @@ export function parse(record: string): ParsedRecord {
     if (equalsIndex === -1) {
       issues.push({
         code: "malformed-chunk",
-        severity: "error",
+        severity: "warning",
         tag: null,
-        message: `Segment "${trimmedChunk}" has no "=" — every tag must be written as name=value.`,
+        message: `Segment "${trimmedChunk}" has no "=" — every tag must be written as name=value. Per RFC 9989 §4.8 a syntax error here is discarded and the rest of the record is still processed, so this doesn't invalidate the record; it just means whatever you intended by this segment isn't happening.`,
       });
       return;
     }
@@ -128,14 +166,39 @@ export function parse(record: string): ParsedRecord {
     if (!TAG_NAME_PATTERN.test(rawName)) {
       issues.push({
         code: "invalid-tag-name",
-        severity: "error",
+        severity: "warning",
         tag: null,
-        message: `"${rawName || trimmedChunk}" isn't a valid tag name — tag names are letters only (a-z), so this segment is being skipped.`,
+        message: `"${rawName || trimmedChunk}" isn't a valid tag name — the ABNF makes tag names 1*ALPHA, letters only. Receivers discard this segment (RFC 9989 §4.8) and process the rest of the record, so anything you meant to configure here isn't in effect.`,
       });
       return;
     }
 
     const name = rawName.toLowerCase();
+
+    // dmarc-tag = 1*ALPHA equals 1*dmarc-value — "1*", so a tag with no
+    // value at all is a syntax error rather than a tag set to the empty
+    // string. It matters which one it is: discarded means the tag's
+    // *default* applies, which for adkim/aspf is relaxed alignment.
+    if (value.length === 0) {
+      issues.push({
+        code: "empty-tag-value",
+        severity: "warning",
+        tag: name,
+        message: `"${rawName}=" has no value. The ABNF requires at least one character (1*dmarc-value), so receivers discard this tag and fall back to its default — which is not the same as the tag being absent only if you were relying on it.`,
+      });
+      return;
+    }
+
+    if (!VALUE_CHARACTER_PATTERN.test(value)) {
+      issues.push({
+        code: "invalid-value-characters",
+        severity: "warning",
+        tag: name,
+        message: `"${rawName}=" contains ${describeInvalidCharacters(value)}, outside the printable US-ASCII range the ABNF allows for a value (%x20-3A / %x3C-7E). This is usually a smart quote, an en dash or a non-breaking space substituted by a word processor — visually identical to the ASCII character it replaced, and discarded by receivers.`,
+      });
+      return;
+    }
+
     entries.push({ name, rawName, value });
 
     if (seenNames.has(name)) {

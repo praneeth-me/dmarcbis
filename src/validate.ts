@@ -41,7 +41,7 @@ const CURRENT_TAGS = new Set([
 ]);
 
 const REMOVED_TAGS: Record<string, string> = {
-  pct: `pct= was removed in RFC 9989 (DMARCbis). DMARCbis receivers ignore it outright, which quietly turns a partial rollout into full enforcement at whatever p= says the moment a receiver updates to the new spec. If a gradual rollout was the goal, use t=y (testing mode) instead.`,
+  pct: `pct= was removed in RFC 9989 (DMARCbis) and is marked "historic" in IANA's DMARC Tags registry. DMARCbis receivers ignore it outright, which quietly turns a partial rollout into full enforcement at whatever p= says the moment a receiver updates to the new spec. RFC 9989 Appendix A.6 explains why it went: operators found values other than 0 and 100 were applied inconsistently between implementations. t=y is the replacement and is analogous to the old pct=0; t=n (the default) is analogous to pct=100.`,
   rf: `rf= (requested failure-report format) was removed in RFC 9989. Report format is no longer sender-configurable — receivers decide unilaterally, and RFC 9990 makes XML the mandatory aggregate-report format regardless. This tag is silently ignored by DMARCbis receivers.`,
   ri: `ri= (requested aggregate-report interval) was removed in RFC 9989. Reporting interval is no longer sender-configurable — receivers choose their own schedule. This tag is silently ignored by DMARCbis receivers.`,
 };
@@ -73,25 +73,87 @@ function isValidFoValue(raw: string): boolean {
   const allowed = new Set(["0", "1", "d", "s"]);
   if (!tokens.every((token) => allowed.has(token))) return false;
   const numericTokenCount = tokens.filter((token) => token === "0" || token === "1").length;
-  return numericTokenCount <= 1;
+  if (numericTokenCount > 1) return false;
+  // "dmarc-afrf = "d" / "s" ; each may appear at most once in dmarc-fo" —
+  // the constraint is in a comment on the ABNF rule rather than in the
+  // grammar itself, which is exactly why it's easy to miss. Every one of
+  // the three dmarc-fo alternatives admits at most one "d" and one "s".
+  return (
+    tokens.filter((token) => token === "d").length <= 1 &&
+    tokens.filter((token) => token === "s").length <= 1
+  );
 }
 
-/** rua/ruf hold a comma-separated dmarc-urilist. Each entry is a URI
- * (mailto: in practice, though the ABNF doesn't forbid others — https: is
- * the other one RFC 9990 explicitly supports for aggregate reports) with an
- * optional "!<size><unit>" cap, e.g. "mailto:dmarc@example.com!10m". This
- * doesn't attempt full RFC 3986 URI validation — it's a sanity check for
- * "did you paste a plausible reporting address," not a URI RFC conformance
- * suite. */
-const REPORT_URI_PATTERN = /^(mailto|https):\S+?(![0-9]+[kmgt]?)?$/i;
+/**
+ * rua/ruf hold a dmarc-urilist: comma-separated entries, each of which the
+ * ABNF defines as a bare `URI` imported from RFC 3986. Three consequences
+ * that a scheme allow-list gets wrong, and this library used to:
+ *
+ *   1. "Any valid URI can be specified" (§4.7, for both tags). There is no
+ *      list of permitted schemes. Receivers MUST implement `mailto:` and
+ *      MUST *ignore* URIs whose scheme they don't support — so an exotic
+ *      scheme makes that one destination inert, not the record invalid.
+ *   2. Commas and exclamation points inside a URI MUST be percent-encoded
+ *      (§4.8). The comma rule is what makes splitting on "," safe.
+ *   3. The trailing "!100m" size limit is `obs-dmarc-report-size` — RFC
+ *      9989 marks it obsolete and tells reporters to ignore it. It's still
+ *      grammatical, so it parses, but it does nothing.
+ */
+const OBSOLETE_SIZE_LIMIT_PATTERN = /!([0-9]+[kmgt]?)$/i;
 
-function findInvalidReportUris(raw: string): string[] {
+interface ReportUriFinding {
+  entry: string;
+  /** Set when the entry isn't a URI at all (no scheme, unparseable). */
+  malformed: boolean;
+  /** Set for a syntactically fine URI whose scheme no receiver is obliged
+   * to support — informational, not an error. */
+  unsupportedScheme: string | null;
+  /** Set when the entry carries an obs-dmarc-report-size suffix. */
+  obsoleteSizeLimit: string | null;
+}
+
+/** Schemes a Mail Receiver is required or expected to handle. `mailto:` is
+ * the one every receiver MUST implement (§4.7); `https:` is the transport
+ * RFC 9990 describes for aggregate report delivery. Anything else is legal
+ * to publish and legal for a receiver to drop on the floor. */
+const EXPECTED_SCHEMES = new Set(["mailto:", "https:"]);
+
+function inspectReportUris(raw: string): ReportUriFinding[] {
   const entries = raw
     .split(",")
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
-  if (entries.length === 0) return [raw];
-  return entries.filter((entry) => !REPORT_URI_PATTERN.test(entry));
+
+  if (entries.length === 0) {
+    return [{ entry: raw, malformed: true, unsupportedScheme: null, obsoleteSizeLimit: null }];
+  }
+
+  return entries.flatMap((entry) => {
+    const sizeMatch = OBSOLETE_SIZE_LIMIT_PATTERN.exec(entry);
+    const obsoleteSizeLimit = sizeMatch?.[1] ?? null;
+    // An unencoded "!" is only ever the obsolete size limit, so strip it
+    // before parsing the URI itself — otherwise a perfectly good address
+    // with a legacy cap on it reads as malformed.
+    const uriText = sizeMatch ? entry.slice(0, sizeMatch.index) : entry;
+
+    let scheme: string | null = null;
+    try {
+      scheme = new URL(uriText).protocol.toLowerCase();
+    } catch {
+      scheme = null;
+    }
+
+    const finding: ReportUriFinding = {
+      entry,
+      malformed: scheme === null,
+      unsupportedScheme: scheme && !EXPECTED_SCHEMES.has(scheme) ? scheme : null,
+      obsoleteSizeLimit,
+    };
+
+    const isClean =
+      !finding.malformed && !finding.unsupportedScheme && !finding.obsoleteSizeLimit;
+    return isClean ? [] : [finding];
+  });
 }
 
 export function validate(parsed: ParsedRecord): Diagnostic[] {
@@ -153,43 +215,92 @@ function validateVersionTag(parsed: ParsedRecord, diagnostics: Diagnostic[]): vo
   }
 }
 
+/**
+ * RFC 9989 §4.10.1 attaches a consequence to a broken policy tag that is
+ * far larger than the tag itself, and it is the single least intuitive
+ * rule in the specification:
+ *
+ *   "If a retrieved DMARC Policy Record does not contain a valid 'p' tag,
+ *    or contains an 'sp' or 'np' tag that is not valid, then:
+ *      - If a 'rua' tag is present and contains at least one syntactically
+ *        valid reporting URI, the Mail Receiver MUST act as if a record
+ *        containing 'p=none' was retrieved and continue processing.
+ *      - Otherwise, the Mail Receiver applies no DMARC processing to this
+ *        message."
+ *
+ * So a single typo in `sp=` does not disable `sp=`. It discards the whole
+ * record's enforcement — `p=reject` included — and, with no usable rua, it
+ * switches DMARC off for the domain entirely. An operator reading a
+ * tag-scoped "invalid sp value" error would reasonably conclude their
+ * p=reject was still standing. It isn't.
+ */
+function describePolicyFallback(parsed: ParsedRecord): {
+  severity: "error";
+  consequence: string;
+} {
+  const rua = parsed.tags["rua"];
+  const hasUsableRua =
+    rua !== undefined && rua.split(",").some((entry) => isParseableUri(entry.trim()));
+
+  return {
+    severity: "error",
+    consequence: hasUsableRua
+      ? `Because this record carries a rua= with at least one syntactically valid URI, receivers MUST act as though it said p=none and keep processing (RFC 9989 §4.10.1). Aggregate reports keep arriving, so this fails quietly: any enforcement you published here is not being applied.`
+      : `This record has no rua= with a syntactically valid URI, so receivers apply no DMARC processing to the message at all (RFC 9989 §4.10.1) — not p=none, but DMARC switched off for this domain. No enforcement and no reports, which is also why nothing will arrive to tell you.`,
+  };
+}
+
+function isParseableUri(entry: string): boolean {
+  const withoutSizeLimit = entry.replace(OBSOLETE_SIZE_LIMIT_PATTERN, "");
+  try {
+    new URL(withoutSizeLimit);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function validatePolicyTags(parsed: ParsedRecord, diagnostics: Diagnostic[]): void {
   const p = parsed.tags["p"];
   const sp = parsed.tags["sp"];
   const np = parsed.tags["np"];
 
   if (p === undefined) {
+    const { severity, consequence } = describePolicyFallback(parsed);
     diagnostics.push({
       code: "missing-policy",
-      severity: "warning",
+      severity,
       tag: "p",
-      message: `No p= tag was found. RFC 9989 treats a policy record with no p= as if it said p=none — nothing will happen to mail that fails authentication unless sp=/np= say otherwise. Add an explicit p= if that's not the intent.`,
+      message: `No p= tag was found. ${consequence} Add an explicit p= — it is the tag that decides what happens to mail failing authentication.`,
     });
   } else if (!POLICY_VALUES.has(p.toLowerCase())) {
+    const { severity, consequence } = describePolicyFallback(parsed);
     diagnostics.push({
       code: "invalid-p-value",
-      severity: "error",
+      severity,
       tag: "p",
-      message: `p="${p}" isn't valid — must be one of none, quarantine, or reject.`,
+      message: `p="${p}" isn't valid — must be one of none, quarantine, or reject. ${consequence}`,
     });
   }
 
   if (sp !== undefined && !POLICY_VALUES.has(sp.toLowerCase())) {
+    const { severity, consequence } = describePolicyFallback(parsed);
     diagnostics.push({
       code: "invalid-sp-value",
-      severity: "error",
+      severity,
       tag: "sp",
-      message: `sp="${sp}" isn't valid — must be one of none, quarantine, or reject.`,
+      message: `sp="${sp}" isn't valid — must be one of none, quarantine, or reject. This does not just disable sp=: an invalid sp= invalidates the policy of the entire record. ${consequence}`,
     });
   }
 
   if (np !== undefined) {
     if (!POLICY_VALUES.has(np.toLowerCase())) {
+      const { severity, consequence } = describePolicyFallback(parsed);
       diagnostics.push({
         code: "invalid-np-value",
-        severity: "error",
+        severity,
         tag: "np",
-        message: `np="${np}" isn't valid — must be one of none, quarantine, or reject.`,
+        message: `np="${np}" isn't valid — must be one of none, quarantine, or reject. This does not just disable np=: an invalid np= invalidates the policy of the entire record. ${consequence}`,
       });
     } else if (np.toLowerCase() === "reject") {
       diagnostics.push({
@@ -212,33 +323,53 @@ function validateAlignmentTags(parsed: ParsedRecord, diagnostics: Diagnostic[]):
   const adkim = parsed.tags["adkim"];
   const aspf = parsed.tags["aspf"];
 
+  // Unlike p/sp/np, a bad alignment value has no §4.10.1 consequence: §4.8
+  // discards the syntax error "in favor of default values", and the default
+  // for both tags is "r". That makes this a warning rather than an error,
+  // and the specific thing worth saying is which way it silently fails —
+  // someone who published adkim=strict (a plausible typo for "s") gets
+  // relaxed alignment, the looser of the two, with no other signal.
   if (adkim !== undefined && !RELAXED_STRICT_VALUES.has(adkim.toLowerCase())) {
     diagnostics.push({
       code: "invalid-adkim-value",
-      severity: "error",
+      severity: "warning",
       tag: "adkim",
-      message: `adkim="${adkim}" isn't valid — must be "r" (relaxed) or "s" (strict).`,
+      message: `adkim="${adkim}" isn't valid — must be "r" (relaxed) or "s" (strict). Receivers discard the invalid value and fall back to the default, "r", so DKIM alignment is relaxed here — the looser setting, not the stricter one.`,
     });
   }
 
   if (aspf !== undefined && !RELAXED_STRICT_VALUES.has(aspf.toLowerCase())) {
     diagnostics.push({
       code: "invalid-aspf-value",
-      severity: "error",
+      severity: "warning",
       tag: "aspf",
-      message: `aspf="${aspf}" isn't valid — must be "r" (relaxed) or "s" (strict).`,
+      message: `aspf="${aspf}" isn't valid — must be "r" (relaxed) or "s" (strict). Receivers discard the invalid value and fall back to the default, "r", so SPF alignment is relaxed here — the looser setting, not the stricter one.`,
     });
   }
 }
 
 function validateFoTag(parsed: ParsedRecord, diagnostics: Diagnostic[]): void {
   const fo = parsed.tags["fo"];
-  if (fo !== undefined && !isValidFoValue(fo)) {
+  if (fo === undefined) return;
+
+  if (!isValidFoValue(fo)) {
     diagnostics.push({
       code: "invalid-fo-value",
-      severity: "error",
+      severity: "warning",
       tag: "fo",
-      message: `fo="${fo}" isn't valid — must be a colon-separated combination of "0"/"1" (pick at most one) and "d"/"s", e.g. "0", "1:d", or "d:s".`,
+      message: `fo="${fo}" isn't valid — a colon-separated combination of "0"/"1" (mutually exclusive, at most one) and "d"/"s" (at most one each), e.g. "0", "1:d", or "d:s". Receivers discard it and fall back to the default "0": a failure report only when every authentication mechanism fails to produce an aligned pass.`,
+    });
+  }
+
+  // "This tag's content MUST be ignored if a 'ruf' tag (below) is not also
+  // specified" (§4.7). fo= alone is inert — and it looks like it is doing
+  // something, which is why it's worth saying out loud.
+  if (parsed.tags["ruf"] === undefined) {
+    diagnostics.push({
+      code: "fo-without-ruf",
+      severity: "warning",
+      tag: "fo",
+      message: `fo= is set but there's no ruf= tag. RFC 9989 §4.7 says fo='s content MUST be ignored when ruf= is absent, so this tag currently does nothing — failure reports are only generated for a domain that publishes ruf=. Either add ruf= or drop fo=.`,
     });
   }
 }
@@ -248,9 +379,9 @@ function validateBooleanAndPsdTags(parsed: ParsedRecord, diagnostics: Diagnostic
   if (t !== undefined && !YES_NO_VALUES.has(t.toLowerCase())) {
     diagnostics.push({
       code: "invalid-t-value",
-      severity: "error",
+      severity: "warning",
       tag: "t",
-      message: `t="${t}" isn't valid — must be "y" or "n". t=y is RFC 9989's replacement for the old pct=<N> partial rollout: instead of enforcing against a percentage of mail, it asks receivers to apply the policy one level below the one you published.`,
+      message: `t="${t}" isn't valid — must be "y" or "n". Receivers discard it and fall back to the default "n", meaning the published policy applies in full rather than in testing mode. t=y is RFC 9989's replacement for the old pct= partial rollout (Appendix A.6: t=y is analogous to pct=0, t=n to pct=100).`,
     });
   } else if (t?.toLowerCase() === "y") {
     // RFC 9989 §4.7 defines t=y as a *downgrade by one level*, not as a
@@ -260,18 +391,34 @@ function validateBooleanAndPsdTags(parsed: ParsedRecord, diagnostics: Diagnostic
     // the replacement for pct= and everyone's muscle memory is the old
     // percentage ramp, spell the actual effect out rather than assuming the
     // reader infers it.
-    const policy = parsed.tags["p"]?.toLowerCase();
+    // t= applies to "the Domain Owner Assessment Policy declared in the 'p',
+    // 'sp', and/or 'np' tags" (§4.7) — all three, not just p. An earlier
+    // version read p= alone, so `p=none; sp=reject; t=y` was reported as
+    // changing nothing, when in fact it downgrades subdomain enforcement
+    // from reject to quarantine.
+    const downgrade: Record<string, string> = {
+      reject: "quarantine",
+      quarantine: "none",
+    };
+    const affected: string[] = [];
+    for (const tagName of ["p", "sp", "np"] as const) {
+      const value = parsed.tags[tagName]?.toLowerCase();
+      if (value === undefined) continue;
+      const lowered = downgrade[value];
+      if (lowered === undefined) continue;
+      affected.push(`${tagName}=${value} is being applied as ${lowered}`);
+    }
+
     const effect =
-      policy === "reject"
-        ? `you published p=reject, so failing mail is being quarantined, not rejected`
-        : policy === "quarantine"
-          ? `you published p=quarantine, so failing mail is being treated as p=none — nothing is happening to it yet`
-          : `it applies one level below whatever p= says (reject becomes quarantine; quarantine becomes none). At p=none there is no lower level, so it changes nothing`;
+      affected.length > 0
+        ? affected.join("; ")
+        : `nothing is being downgraded here — the tag has no effect on a policy of "none" (§4.7), and there is no level below it`;
+
     diagnostics.push({
       code: "t-testing-mode",
       severity: "info",
       tag: "t",
-      message: `t=y puts this record in testing mode: receivers apply the policy one level below the one published — ${effect}. Reports still arrive as though the full policy were in force, which is the point: you see the impact before taking it. Drop t=y when you want the published policy to actually apply.`,
+      message: `t=y puts this record in testing mode: receivers apply each declared policy one level below the one published (reject becomes quarantine; quarantine becomes none). Right now, ${effect}. Reports still arrive as though the full policy were in force, which is the point: you see the impact before taking it. Drop t=y when you want the published policy to actually apply.`,
     });
   }
 
@@ -279,9 +426,65 @@ function validateBooleanAndPsdTags(parsed: ParsedRecord, diagnostics: Diagnostic
   if (psd !== undefined && !PSD_VALUES.has(psd.toLowerCase())) {
     diagnostics.push({
       code: "invalid-psd-value",
-      severity: "error",
+      severity: "warning",
       tag: "psd",
-      message: `psd="${psd}" isn't valid — must be "y" (this is a public suffix domain), "n" (it isn't), or "u" (undeclared).`,
+      message: `psd="${psd}" isn't valid — must be "y" (this is a public suffix domain), "n" (it isn't), or "u" (undeclared). Receivers discard it and fall back to the default "u", which means the organizational domain is worked out by the DNS tree walk instead of being declared here.`,
+    });
+  }
+
+  // "DMARC Policy Records for multi-organizational PSDs MUST NOT include the
+  // 'ruf' tag" (§10.2). A PSD's failure reports would carry message content
+  // belonging to the separate organizations underneath it — the one place in
+  // DMARC where a reporting tag is prohibited outright rather than discouraged.
+  if (psd?.toLowerCase() === "y" && parsed.tags["ruf"] !== undefined) {
+    diagnostics.push({
+      code: "psd-ruf-prohibited",
+      severity: "error",
+      tag: "ruf",
+      message: `This record declares psd=y (a public suffix domain) and also publishes ruf=. RFC 9989 §10.2 states that DMARC Policy Records for multi-organizational PSDs MUST NOT include the ruf= tag: failure reports can carry message content belonging to the independent organizations registered beneath the suffix, who have not agreed to send it here. Remove ruf=, or psd=y if this domain is not actually a PSD.`,
+    });
+  }
+}
+
+function validateReportingUriList(
+  tag: "rua" | "ruf",
+  raw: string,
+  diagnostics: Diagnostic[]
+): void {
+  const findings = inspectReportUris(raw);
+
+  const malformed = findings.filter((finding) => finding.malformed);
+  if (malformed.length > 0) {
+    const list = malformed.map((finding) => `"${finding.entry}"`).join(", ");
+    diagnostics.push({
+      code: "invalid-report-uri",
+      severity: "error",
+      tag,
+      message: `${tag}= contains ${malformed.length === 1 ? "an entry that isn't" : "entries that aren't"} a URI at all: ${list}. Each entry must be a full URI with a scheme (RFC 3986), comma-separated — "mailto:dmarc@example.com", not a bare address. Note that commas and exclamation points inside a URI have to be percent-encoded, since a comma separates entries.`,
+    });
+  }
+
+  const unsupported = findings.filter((finding) => finding.unsupportedScheme !== null);
+  if (unsupported.length > 0) {
+    const list = unsupported
+      .map((finding) => `"${finding.entry}" (${finding.unsupportedScheme})`)
+      .join(", ");
+    diagnostics.push({
+      code: "unsupported-report-uri-scheme",
+      severity: "info",
+      tag,
+      message: `${tag}= includes ${list}. RFC 9989 §4.7 permits any valid URI here, so this is not an error — but receivers MUST ignore URIs whose scheme they don't support, and the only scheme every receiver is required to implement is "mailto:". Expect this destination to be skipped by most or all of them.`,
+    });
+  }
+
+  const obsolete = findings.filter((finding) => finding.obsoleteSizeLimit !== null);
+  if (obsolete.length > 0) {
+    const list = obsolete.map((finding) => `"!${finding.obsoleteSizeLimit}"`).join(", ");
+    diagnostics.push({
+      code: "obsolete-report-size-limit",
+      severity: "warning",
+      tag,
+      message: `${tag}= carries a report size limit (${list}). RFC 9989 §4.8 marks this syntax obsolete — it is "obs-dmarc-report-size" in the ABNF, and reporters are told to ignore it if they find it. The record still parses, but the cap does nothing: reports arrive at whatever size the receiver generates. Remove it, and note that an exclamation point kept for any other purpose has to be percent-encoded.`,
     });
   }
 }
@@ -289,28 +492,12 @@ function validateBooleanAndPsdTags(parsed: ParsedRecord, diagnostics: Diagnostic
 function validateReportingTags(parsed: ParsedRecord, diagnostics: Diagnostic[]): void {
   const rua = parsed.tags["rua"];
   if (rua !== undefined) {
-    const invalid = findInvalidReportUris(rua);
-    if (invalid.length > 0) {
-      diagnostics.push({
-        code: "invalid-report-uri",
-        severity: "error",
-        tag: "rua",
-        message: `rua= contains ${invalid.length === 1 ? "an entry" : "entries"} that ${invalid.length === 1 ? "isn't" : "aren't"} a valid reporting URI: ${invalid.map((entry) => `"${entry}"`).join(", ")}. Expected mailto: or https: URIs, comma-separated, e.g. "mailto:dmarc@example.com".`,
-      });
-    }
+    validateReportingUriList("rua", rua, diagnostics);
   }
 
   const ruf = parsed.tags["ruf"];
   if (ruf !== undefined) {
-    const invalid = findInvalidReportUris(ruf);
-    if (invalid.length > 0) {
-      diagnostics.push({
-        code: "invalid-report-uri",
-        severity: "error",
-        tag: "ruf",
-        message: `ruf= contains ${invalid.length === 1 ? "an entry" : "entries"} that ${invalid.length === 1 ? "isn't" : "aren't"} a valid reporting URI: ${invalid.map((entry) => `"${entry}"`).join(", ")}. Expected mailto: or https: URIs, comma-separated, e.g. "mailto:dmarc@example.com".`,
-      });
-    }
+    validateReportingUriList("ruf", ruf, diagnostics);
 
     diagnostics.push({
       code: "ruf-privacy-notice",
@@ -332,7 +519,13 @@ function validateRemovedTags(parsed: ParsedRecord, diagnostics: Diagnostic[]): v
 function validateUnrecognizedTags(parsed: ParsedRecord, diagnostics: Diagnostic[]): void {
   const seen = new Set<string>();
   for (const entry of parsed.entries) {
-    if (CURRENT_TAGS.has(entry.name) || entry.name in REMOVED_TAGS) continue;
+    // Object.hasOwn, not `in`: `in` walks the prototype chain, and because
+    // parse() lower-cases tag names, a record carrying `constructor=...`
+    // matched Object.prototype's own member and was silently skipped here
+    // — no unrecognized-tag diagnostic, no removed-tag diagnostic, nothing.
+    // `constructor` is the only Object.prototype member reachable through
+    // the lower-cased 1*ALPHA tag grammar, which is what kept it hidden.
+    if (CURRENT_TAGS.has(entry.name) || Object.hasOwn(REMOVED_TAGS, entry.name)) continue;
     if (seen.has(entry.name)) continue;
     seen.add(entry.name);
     diagnostics.push({
