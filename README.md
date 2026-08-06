@@ -21,13 +21,22 @@ It isn't wrong, exactly — receivers that still speak RFC 7489 will honour
 it — but it's advice from a decade-old spec, and the tag it relies on
 (`pct=`) is gone from the new one.
 
+## Status
+
+Pre-1.0 and **not yet published to npm**. `package.json` still points `main`,
+`types` and `exports` at TypeScript source, which suits a bundler but breaks
+consumers on CommonJS, on older Node, or on any toolchain expecting a package
+to ship JavaScript. A release needs a build emitting `.js` + `.d.ts` first, so
+`private: true` stays set until then — `npm publish` refuses while it is,
+deliberately.
+
+Read it, borrow from it, or open an issue. Depending on it in production is
+premature.
+
 ## Install
 
-This library isn't published to npm — it's staged in this repo for review
-before moving to its own public repository. To use it locally:
-
 ```bash
-git clone <this-repo>
+git clone https://github.com/praneeth-me/dmarcbis.git
 cd dmarcbis
 npm install
 ```
@@ -58,10 +67,13 @@ for (const d of diagnostics) {
 Output:
 
 ```
-[warning] (pct) removed-tag: pct= was removed in RFC 9989 (DMARCbis). DMARCbis
-receivers ignore it outright, which quietly turns a partial rollout into full
-enforcement at whatever p= says the moment a receiver updates to the new spec.
-If a gradual rollout was the goal, use t=y (testing mode) instead.
+[warning] (pct) removed-tag: pct= was removed in RFC 9989 (DMARCbis) and is
+marked "historic" in IANA's DMARC Tags registry. DMARCbis receivers ignore it
+outright, which quietly turns a partial rollout into full enforcement at
+whatever p= says the moment a receiver updates to the new spec. RFC 9989
+Appendix A.6 explains why it went: operators found values other than 0 and 100
+were applied inconsistently between implementations. t=y is the replacement and
+is analogous to the old pct=0; t=n (the default) is analogous to pct=100.
 ```
 
 Neither function ever throws. `parse()` reports syntax problems (an
@@ -81,6 +93,41 @@ interface Diagnostic {
 too (a duplicated tag, a malformed chunk) — so a caller gets one complete
 list of everything wrong with a record from a single `validate(parse(record))`
 call, without having to merge two arrays by hand.
+
+### What `severity` means
+
+The three levels follow the line RFC 9989 itself draws, which is not the line
+"how wrong does this look":
+
+- **`error`** — the policy you published is not the policy in force. Either the
+  whole record is disregarded (a missing, misplaced or misspelt `v=`), or
+  §4.10.1's fallback has been triggered by an absent or invalid `p=`/`sp=`/`np=`
+  and enforcement has collapsed to `p=none` — or to no DMARC processing at all.
+- **`warning`** — the record stands and its policy applies, but some part of it
+  isn't doing what it appears to. §4.8 requires receivers to discard a syntax
+  error "in favor of default values (if any) or ignored outright", so a
+  malformed tag reverts to a default rather than invalidating anything.
+- **`info`** — worth knowing, not a defect.
+
+The distinction that matters most: a junk segment in the middle of an otherwise
+good record is a **warning**, because a receiver steps over it and applies your
+`p=reject` exactly as written. Meanwhile a single typo in `sp=` is an
+**error**, because it does not disable `sp=` — it discards the record's entire
+enforcement, `p=reject` included. That asymmetry is unintuitive and is most of
+the reason this library reports the way it does.
+
+`code` is the stable API and never changes meaning; a new situation gets a new
+code. `severity` is a judgement and may be re-tuned against the RFC — see
+[CHANGELOG.md](CHANGELOG.md).
+
+### What this doesn't do
+
+- No DNS lookups. You bring the record string; where it came from is your
+  business.
+- No policy *evaluation* — it doesn't tell you whether a given message passes
+  DMARC, only whether the record is well-formed and current.
+- No organizational-domain resolution or DNS tree walk (§4.10), no PSL.
+- No report parsing — that's RFC 9990 and RFC 9991 territory.
 
 ### A worked example: `np=` and the DNSSEC gotcha
 
@@ -131,10 +178,18 @@ There's no `dist/` and no bundler. `npm test` and `npm run demo` run the
 load time without a separate compile step, and this project pins Node 24
 (see the parent repo's `.nvmrc`), well past that. `tsc` is still a
 devDependency, but only for `npm run typecheck`, which type-checks the
-source without emitting anything. When this library eventually moves to
-its own repo for publishing, that's the point to add a real build
-(`tsc` emitting `dist/` + `.d.ts` files) — there's deliberately no packaging
-concern mixed into this staging area yet.
+source without emitting anything. Adding a real build (`tsc` emitting `dist/`
+plus `.d.ts`) is the gate on a first npm release — see "Status" above.
+
+## Development
+
+This repository is a **mirror**. The library is developed inside the
+[praneeth.me](https://praneeth.me) site repo and republished here with
+`git subtree split`, so every push replaces this repo's history wholesale.
+
+A pull request opened here can't be merged as-is — it would be overwritten on
+the next publish. Open an issue instead, or send a patch in one and it'll be
+applied upstream with attribution.
 
 ## Project layout
 
@@ -160,12 +215,12 @@ dmarcbis/
 | Tag             | Status in RFC 9989                                                    |
 | --------------- | ----------------------------------------------------------------------- |
 | `v`              | Required, must be first, value is case-sensitive `DMARC1`                |
-| `p`              | Still current; record defaults to `p=none` if absent                       |
-| `sp`             | Still current — applies to subdomains that **exist**                        |
-| `np`             | **New** — applies to subdomains that **don't exist**; falls back to `sp`, then `p` |
-| `adkim`, `aspf`  | Still current (`r`/`s`)                                                       |
-| `fo`             | Still current                                                                    |
-| `rua`, `ruf`     | Still current (`ruf` carries a privacy note — it can include message content)     |
+| `p`              | Still current. If absent **or invalid**, §4.10.1 applies: receivers act as `p=none` when a valid `rua` URI is present, and apply **no DMARC processing at all** otherwise |
+| `sp`             | Still current — applies to subdomains that **exist**. An invalid value triggers the same §4.10.1 collapse as `p`, taking the whole record's enforcement with it |
+| `np`             | **New** — applies to subdomains that **don't exist**; falls back to `sp`, then `p`. An invalid value collapses the record the same way |
+| `adkim`, `aspf`  | Still current (`r`/`s`). An invalid value falls back to the default `r` — the *looser* of the two |
+| `fo`             | Still current. **Ignored entirely if `ruf=` is absent** (§4.7); `d` and `s` may each appear at most once |
+| `rua`, `ruf`     | Still current. **Any valid URI** is permitted (§4.7) — there is no scheme allow-list, and receivers ignore schemes they don't support. The trailing `!size` cap is obsolete syntax (`obs-dmarc-report-size`). `ruf` carries a privacy note — it can include message content |
 | `t`              | **New** — boolean testing flag, replaces `pct`'s role                              |
 | `psd`            | **New** — declares a public suffix domain                                           |
 | `pct`            | **Removed** — partial/percentage enforcement is gone                                 |
