@@ -33,6 +33,41 @@ Initial version.
 
 ## Unreleased
 
+### Added — RFC 9990 and RFC 9991
+
+A read of the two companion RFCs in full. They define report *formats and
+delivery*, not record syntax — every policy record tag stays in RFC 9989 §4.7,
+which is what this library validates, so the existing scope was right. Three
+places where they nonetheless bear on a record:
+
+- **`validate()` takes an optional `ValidateOptions` second argument.** The
+  only field is `policyDomain`. Supplying it enables RFC 9990 §4's external
+  destination check: where `rua=` (or `ruf=`, which RFC 9991 §5 subjects to the
+  same procedure) points outside the publishing domain, the destination must
+  authorize it with a `<policy-domain>._report._dmarc.<host>` TXT record, and
+  where it hasn't, the receiver **MUST ignore the URI** — reports stop with no
+  error anywhere. New `external-report-destination` diagnostic names the exact
+  record to look for and the wildcard form that can cover it.
+
+  It is `info`, not a verdict, and permanently so: the library resolves no DNS,
+  and §4 compares Organizational Domains, which is the tree walk's output.
+  Equal and subdomain-related names are silent; siblings are surfaced with the
+  ambiguity stated in the message. Omitting the option changes nothing.
+- **`psd-ruf-prohibited` now cites RFC 9991 §2 alongside RFC 9989 §10.2.**
+  9989 forbids publishing `ruf=` on a `psd=y` record; 9991 §2 forbids report
+  generators acting on it, "unless there are specific agreements between the
+  interested parties." That second half is what makes the tag inert in practice
+  rather than merely ill-advised, and the caveat is named rather than assumed
+  away.
+- **New `ruf-rarely-honoured` info diagnostic.** RFC 9991 §7 records that many
+  large providers restrict or entirely disable failure reporting on privacy
+  grounds. An operator who publishes `ruf=` and sees nothing arrive will go
+  hunting for a fault that isn't there, so the library says up front that
+  silence is the expected outcome.
+
+`README.md` gains a "what a clean result does not mean" list for the same
+reason: no findings means well-formed and current, not working.
+
 ### Fixed — RFC 9989 compliance
 
 A rule-by-rule audit against the published RFC turned up several places where

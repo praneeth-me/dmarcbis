@@ -1,4 +1,4 @@
-import type { Diagnostic, ParsedRecord } from "./types.ts";
+import type { Diagnostic, ParsedRecord, ValidateOptions } from "./types.ts";
 
 /**
  * parse() and validate() are two different jobs, kept in two different
@@ -156,7 +156,7 @@ function inspectReportUris(raw: string): ReportUriFinding[] {
   });
 }
 
-export function validate(parsed: ParsedRecord): Diagnostic[] {
+export function validate(parsed: ParsedRecord, options: ValidateOptions = {}): Diagnostic[] {
   // Anything parse() already flagged (a malformed chunk, a duplicated tag)
   // is still true here — validate() adds to that list rather than
   // re-deriving it, so a caller gets one complete picture from a single
@@ -168,7 +168,7 @@ export function validate(parsed: ParsedRecord): Diagnostic[] {
   validateAlignmentTags(parsed, diagnostics);
   validateFoTag(parsed, diagnostics);
   validateBooleanAndPsdTags(parsed, diagnostics);
-  validateReportingTags(parsed, diagnostics);
+  validateReportingTags(parsed, diagnostics, normalizePolicyDomain(options.policyDomain));
   validateRemovedTags(parsed, diagnostics);
   validateUnrecognizedTags(parsed, diagnostics);
 
@@ -436,12 +436,20 @@ function validateBooleanAndPsdTags(parsed: ParsedRecord, diagnostics: Diagnostic
   // 'ruf' tag" (§10.2). A PSD's failure reports would carry message content
   // belonging to the separate organizations underneath it — the one place in
   // DMARC where a reporting tag is prohibited outright rather than discouraged.
+  //
+  // RFC 9991 §2 states the same rule from the generator's side, and is what
+  // makes this an `error` rather than advice: report generators "MUST NOT
+  // consider 'ruf' tags in DMARC Policy Records that have a 'psd=y' tag". The
+  // tag is inert in practice, not merely ill-advised. Its one escape hatch —
+  // "unless there are specific agreements between the interested parties" —
+  // is an out-of-band arrangement this library has no way to see, so the
+  // message names it instead of assuming it away.
   if (psd?.toLowerCase() === "y" && parsed.tags["ruf"] !== undefined) {
     diagnostics.push({
       code: "psd-ruf-prohibited",
       severity: "error",
       tag: "ruf",
-      message: `This record declares psd=y (a public suffix domain) and also publishes ruf=. RFC 9989 §10.2 states that DMARC Policy Records for multi-organizational PSDs MUST NOT include the ruf= tag: failure reports can carry message content belonging to the independent organizations registered beneath the suffix, who have not agreed to send it here. Remove ruf=, or psd=y if this domain is not actually a PSD.`,
+      message: `This record declares psd=y (a public suffix domain) and also publishes ruf=. RFC 9989 §10.2 states that DMARC Policy Records for multi-organizational PSDs MUST NOT include the ruf= tag: failure reports can carry message content belonging to the independent organizations registered beneath the suffix, who have not agreed to send it here. RFC 9991 §2 binds the other end too — report generators MUST NOT act on ruf= in a psd=y record, absent a specific agreement between the parties — so unless such an agreement exists this tag collects nothing while still advertising an intent to gather other people's mail. Remove ruf=, or psd=y if this domain is not actually a PSD.`,
     });
   }
 }
@@ -489,21 +497,166 @@ function validateReportingUriList(
   }
 }
 
-function validateReportingTags(parsed: ParsedRecord, diagnostics: Diagnostic[]): void {
+/**
+ * RFC 9990 §4 ("Verifying External Destinations"), which RFC 9991 §5 applies
+ * verbatim to `ruf` as well: when reports are directed somewhere outside the
+ * publishing domain, the destination has to opt in by publishing
+ *
+ *     <policy-domain>._report._dmarc.<destination-host>   TXT   "v=DMARC1"
+ *
+ * and where that lookup doesn't confirm the arrangement, "the URI MUST be
+ * ignored by the Mail Receiver generating the report". Silently — a record
+ * that is otherwise perfect delivers no reports at all, which is the single
+ * most common reason a correct-looking rollout stalls in Phase 1 with an
+ * empty inbox.
+ *
+ * Two hard limits on what this library can say about it, both structural:
+ *
+ *   1. It has no DNS. Whether the authorization record actually exists is
+ *      unanswerable here, so this is a "go check" prompt, never a verdict.
+ *   2. The RFC compares *Organizational Domains*, not hostnames, and the
+ *      Organizational Domain is the result of RFC 9989's DNS tree walk. With
+ *      neither DNS nor a public suffix list, the nearest honest approximation
+ *      is the DNS-suffix relationship below — equal names, or one a subdomain
+ *      of the other, share an Organizational Domain in every case that
+ *      matters, so those are correctly silent. Siblings (a policy at
+ *      mail.example.com pointing at reports.example.com) are the residual
+ *      false positive; the message softens for them rather than pretending
+ *      to know.
+ *
+ * Severity is `info` for exactly that reason: the record may be entirely
+ * correct, and only a DNS lookup the caller has to make can settle it.
+ */
+function isSameDnsScope(policyDomain: string, host: string): boolean {
+  return (
+    host === policyDomain ||
+    host.endsWith(`.${policyDomain}`) ||
+    policyDomain.endsWith(`.${host}`)
+  );
+}
+
+/** How many trailing labels two names share. Used only to tell "clearly a
+ * third party" (0–1) from "probably the same organization, but the tree walk
+ * is what decides" (2+) so the advice can be worded accordingly. */
+function commonSuffixLabels(a: string, b: string): number {
+  const left = a.split(".").reverse();
+  const right = b.split(".").reverse();
+  let shared = 0;
+  while (shared < left.length && shared < right.length && left[shared] === right[shared]) {
+    shared += 1;
+  }
+  return shared;
+}
+
+function normalizePolicyDomain(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim().toLowerCase().replace(/^\.+/, "").replace(/\.+$/, "");
+  if (trimmed.length === 0) return null;
+  // Callers copying a name out of `dig` tend to bring the `_dmarc.` label
+  // with it. The policy domain is the name the record is *for*, not where
+  // the TXT record sits, and §4's constructed name uses the former.
+  return trimmed.startsWith("_dmarc.") ? trimmed.slice("_dmarc.".length) : trimmed;
+}
+
+/** The host §4 step 1 calls the "destination host": the authority component's
+ * host for a URI that has one, and the domain part of the address for the
+ * `mailto:` case that every receiver is required to support. WHATWG `URL`
+ * leaves `mailto:` hosts in `pathname`, which is why this isn't just
+ * `.hostname`. */
+function reportDestinationHost(uriText: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(uriText);
+  } catch {
+    return null;
+  }
+
+  const raw =
+    url.protocol === "mailto:"
+      ? url.pathname.slice(url.pathname.lastIndexOf("@") + 1)
+      : url.hostname;
+
+  if (url.protocol === "mailto:" && !url.pathname.includes("@")) return null;
+
+  const host = raw.trim().toLowerCase().replace(/\.+$/, "");
+  return host.length === 0 ? null : host;
+}
+
+function validateExternalDestinations(
+  tag: "rua" | "ruf",
+  raw: string,
+  policyDomain: string,
+  diagnostics: Diagnostic[]
+): void {
+  const external = new Set<string>();
+  let anySibling = false;
+
+  for (const entry of raw.split(",")) {
+    const trimmed = entry.trim().replace(OBSOLETE_SIZE_LIMIT_PATTERN, "");
+    if (trimmed.length === 0) continue;
+
+    const host = reportDestinationHost(trimmed);
+    // A malformed entry is already reported as invalid-report-uri; saying
+    // anything further about where its reports go would be noise.
+    if (host === null || isSameDnsScope(policyDomain, host)) continue;
+
+    external.add(host);
+    if (commonSuffixLabels(policyDomain, host) >= 2) anySibling = true;
+  }
+
+  if (external.size === 0) return;
+
+  const hosts = [...external];
+  const names = hosts.map((host) => `${policyDomain}._report._dmarc.${host}`);
+  const caveat = anySibling
+    ? ` At least one of these shares a parent domain with ${policyDomain}, so it may well resolve to the same Organizational Domain via the tree walk — in which case no authorization record is needed and there is nothing to do here. Confirming that takes the same lookup.`
+    : "";
+
+  diagnostics.push({
+    code: "external-report-destination",
+    severity: "info",
+    tag,
+    message: `${tag}= sends reports to ${hosts.length === 1 ? "a host" : "hosts"} outside ${policyDomain}: ${hosts.join(", ")}. Where the destination's Organizational Domain differs from the publishing domain's, RFC 9990 §4 (applied to ruf= by RFC 9991 §5) requires the destination to authorize it by publishing a TXT record — ${names.map((name) => `"${name}"`).join(", ")} — containing at least v=DMARC1. Without it the receiver MUST ignore the URI, so reports stop silently: nothing arrives, and nothing tells you why. A report processor willing to receive for any domain may cover this with a wildcard at "*._report._dmarc.<host>" instead, so check for that too before assuming it's missing.${caveat} This library cannot resolve DNS, so it cannot tell you whether the record exists — only that this is a destination requiring one.`,
+  });
+}
+
+function validateReportingTags(
+  parsed: ParsedRecord,
+  diagnostics: Diagnostic[],
+  policyDomain: string | null
+): void {
   const rua = parsed.tags["rua"];
   if (rua !== undefined) {
     validateReportingUriList("rua", rua, diagnostics);
+    if (policyDomain !== null) {
+      validateExternalDestinations("rua", rua, policyDomain, diagnostics);
+    }
   }
 
   const ruf = parsed.tags["ruf"];
   if (ruf !== undefined) {
     validateReportingUriList("ruf", ruf, diagnostics);
+    if (policyDomain !== null) {
+      validateExternalDestinations("ruf", ruf, policyDomain, diagnostics);
+    }
 
     diagnostics.push({
       code: "ruf-privacy-notice",
       severity: "warning",
       tag: "ruf",
       message: `ruf= requests failure reports, which can include a forwarded copy of the failing message — headers, and depending on the receiver, some or all of the body — for anyone whose mail fails authentication. Make sure the address it points to is somewhere you're prepared to receive that content, since it may contain other people's personal information.`,
+    });
+
+    // RFC 9991 §7 is unusually blunt for an RFC: "many large-scale providers
+    // limit or entirely disable the generation of failure reports". An
+    // operator who publishes ruf= and sees nothing arrive will go looking for
+    // a fault in their own configuration, so say up front that silence here
+    // is the expected outcome, not evidence of one.
+    diagnostics.push({
+      code: "ruf-rarely-honoured",
+      severity: "info",
+      tag: "ruf",
+      message: `Expect few failure reports or none at all: RFC 9991 §7 notes that many large providers restrict or entirely disable failure reporting on privacy grounds, and nothing obliges a receiver to send them. An empty ruf= mailbox is the normal outcome and is not a sign your record is broken — aggregate reports via rua= are what the rollout should be measured on.`,
     });
   }
 }

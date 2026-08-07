@@ -448,3 +448,150 @@ test("the DNSSEC compact-denial caveat names the affected providers", () => {
     assert.ok(caveat!.message.includes(provider), `expected message to mention ${provider}`);
   }
 });
+
+/**
+ * RFC 9990 §4 external destination verification, applied to ruf= by RFC 9991
+ * §5. These live outside the `cases` table because they are the only
+ * diagnostics that depend on validate()'s options argument.
+ */
+test("external destinations are silent unless a policyDomain is supplied", () => {
+  const record = "v=DMARC1; p=none; rua=mailto:reports@thirdparty.example";
+  const codes = validate(parse(record)).map((d) => d.code);
+  assert.ok(
+    !codes.includes("external-report-destination"),
+    "a record validated without options must produce exactly the diagnostics it always did",
+  );
+});
+
+test("a rua on the policy domain itself needs no authorization record", () => {
+  for (const record of [
+    "v=DMARC1; p=none; rua=mailto:dmarc@example.com",
+    // A subdomain of the policy domain shares its Organizational Domain, so
+    // §4's procedure is not enacted at all.
+    "v=DMARC1; p=none; rua=mailto:dmarc@reports.example.com",
+    // As does a parent, for a record published on a subdomain.
+    "v=DMARC1; p=none; rua=mailto:dmarc@example.com, https://dmarc.example.com/ingest",
+  ]) {
+    const codes = validate(parse(record), { policyDomain: "example.com" }).map((d) => d.code);
+    assert.ok(
+      !codes.includes("external-report-destination"),
+      `expected no external-destination finding for ${record}`,
+    );
+  }
+});
+
+test("a third-party rua names the exact TXT record the destination must publish", () => {
+  const diagnostics = validate(parse("v=DMARC1; p=none; rua=mailto:reports@red.example.net"), {
+    policyDomain: "blue.example.com",
+  });
+  const finding = diagnostics.find((d) => d.code === "external-report-destination");
+  assert.ok(finding, "expected an external-report-destination diagnostic");
+  assert.equal(finding!.severity, "info");
+  assert.equal(finding!.tag, "rua");
+  // The constructed name is the whole value of the diagnostic — an operator
+  // should be able to paste it straight into a `dig` command. This is the
+  // example from RFC 9990 §4.
+  assert.ok(
+    finding!.message.includes("blue.example.com._report._dmarc.red.example.net"),
+    "expected the §4 constructed name verbatim",
+  );
+  assert.match(finding!.message, /wildcard/i, "expected the wildcard escape hatch to be mentioned");
+  assert.match(
+    finding!.message,
+    /cannot resolve DNS|cannot tell you whether/i,
+    "the finding must not read as a verdict — it is a prompt to go and check",
+  );
+});
+
+test("ruf external destinations are checked too, citing RFC 9991", () => {
+  const diagnostics = validate(parse("v=DMARC1; p=none; ruf=mailto:f@vendor.example"), {
+    policyDomain: "example.com",
+  });
+  const finding = diagnostics.find(
+    (d) => d.code === "external-report-destination" && d.tag === "ruf",
+  );
+  assert.ok(finding, "RFC 9991 §5 applies the same procedure to ruf=");
+  assert.ok(finding!.message.includes("example.com._report._dmarc.vendor.example"));
+  assert.match(finding!.message, /9991/, "expected the ruf= citation");
+});
+
+test("a sibling host is flagged but the message concedes the tree walk may clear it", () => {
+  const diagnostics = validate(parse("v=DMARC1; p=none; rua=mailto:d@reports.example.com"), {
+    policyDomain: "mail.example.com",
+  });
+  const finding = diagnostics.find((d) => d.code === "external-report-destination");
+  assert.ok(finding, "neither name is a DNS suffix of the other, so it is surfaced");
+  assert.match(
+    finding!.message,
+    /shares a parent domain|same Organizational Domain/i,
+    "a sibling is the known false positive and the wording has to admit it",
+  );
+});
+
+test("https and size-suffixed rua entries resolve to the right destination host", () => {
+  const diagnostics = validate(
+    parse("v=DMARC1; p=none; rua=https://ingest.vendor.example/dmarc!10m"),
+    { policyDomain: "example.com" },
+  );
+  const finding = diagnostics.find((d) => d.code === "external-report-destination");
+  assert.ok(finding, "an https destination is external in exactly the same way");
+  assert.ok(
+    finding!.message.includes("example.com._report._dmarc.ingest.vendor.example"),
+    "the obsolete !size suffix must not leak into the destination host",
+  );
+});
+
+test("policyDomain is normalized before the comparison", () => {
+  for (const policyDomain of ["EXAMPLE.com", "example.com.", "_dmarc.example.com", " example.com "]) {
+    const codes = validate(parse("v=DMARC1; p=none; rua=mailto:d@example.com"), {
+      policyDomain,
+    }).map((d) => d.code);
+    assert.ok(
+      !codes.includes("external-report-destination"),
+      `"${policyDomain}" should normalize to example.com`,
+    );
+  }
+});
+
+test("a malformed rua entry is reported once, not twice", () => {
+  const codes = validate(parse("v=DMARC1; p=none; rua=not-a-uri"), {
+    policyDomain: "example.com",
+  }).map((d) => d.code);
+  assert.ok(codes.includes("invalid-report-uri"));
+  assert.ok(
+    !codes.includes("external-report-destination"),
+    "an entry that isn't a URI has no destination host to talk about",
+  );
+});
+
+test("the psd=y + ruf error cites both halves of the prohibition", () => {
+  const diagnostics = validate(parse("v=DMARC1; p=reject; psd=y; ruf=mailto:f@example.com"));
+  const finding = diagnostics.find((d) => d.code === "psd-ruf-prohibited");
+  assert.ok(finding);
+  assert.equal(finding!.severity, "error");
+  // 9989 §10.2 forbids publishing it; 9991 §2 forbids generators acting on
+  // it. The second is what makes the tag inert rather than merely unwise.
+  assert.match(finding!.message, /9989/);
+  assert.match(finding!.message, /9991/);
+});
+
+test("publishing ruf= warns that reports may never arrive", () => {
+  const diagnostics = validate(parse("v=DMARC1; p=none; ruf=mailto:f@example.com"));
+  const finding = diagnostics.find((d) => d.code === "ruf-rarely-honoured");
+  assert.ok(finding, "expected a ruf-rarely-honoured diagnostic");
+  assert.equal(finding!.severity, "info");
+  assert.match(
+    finding!.message,
+    /not a sign your record is broken|normal outcome/i,
+    "the point of this finding is to pre-empt a false troubleshooting trail",
+  );
+});
+
+test("validate() still never throws when options are supplied", () => {
+  const inputs = ["", "v=DMARC1; p=none; rua=mailto:@", "v=DMARC1; rua=,,,", "v=DMARC1; rua=mailto:"];
+  for (const input of inputs) {
+    for (const policyDomain of ["example.com", "", ".", "_dmarc."]) {
+      assert.doesNotThrow(() => validate(parse(input), { policyDomain }));
+    }
+  }
+});

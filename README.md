@@ -94,6 +94,41 @@ too (a duplicated tag, a malformed chunk) — so a caller gets one complete
 list of everything wrong with a record from a single `validate(parse(record))`
 call, without having to merge two arrays by hand.
 
+#### Telling `validate()` where the record was published
+
+`validate()` takes an optional second argument. The only field today is
+`policyDomain` — the name the record belongs to, so `example.com` for a record
+found at `_dmarc.example.com`:
+
+```typescript
+validate(parse(record), { policyDomain: "example.com" });
+```
+
+Supplying it enables one check that the record text alone can't support:
+RFC 9990 §4's external destination verification. When `rua=` (or `ruf=`, via
+RFC 9991 §5) points somewhere outside the publishing domain, that destination
+has to opt in by publishing
+
+```
+<policy-domain>._report._dmarc.<destination-host>   TXT   "v=DMARC1"
+```
+
+and if it hasn't, the receiver **MUST ignore the URI**. No error, no bounce —
+the reports simply never arrive, which is the most common reason a
+correct-looking record produces an empty inbox for weeks.
+
+The resulting `external-report-destination` diagnostic is `info`, and
+deliberately so: it hands you the exact name to `dig` and tells you what
+depends on it, but it cannot be a verdict. Two reasons, both permanent —
+this library does no DNS, and RFC 9989 compares *Organizational Domains*
+rather than hostnames, which is the output of the tree walk. Names that are
+equal or in a subdomain relationship are correctly silent; two siblings
+(a record on `mail.example.com` pointing at `reports.example.com`) are
+surfaced with the caveat spelled out in the message.
+
+Omit the option and nothing changes: you get exactly the diagnostics you got
+before.
+
 ### What `severity` means
 
 The three levels follow the line RFC 9989 itself draws, which is not the line
@@ -128,6 +163,25 @@ code. `severity` is a judgement and may be re-tuned against the RFC — see
   DMARC, only whether the record is well-formed and current.
 - No organizational-domain resolution or DNS tree walk (§4.10), no PSL.
 - No report parsing — that's RFC 9990 and RFC 9991 territory.
+
+Worth stating plainly, because a clean result is easy to over-read: **a record
+with no findings is a well-formed, current record — not a record that is
+working.** Several things decide whether DMARC actually functions for a domain,
+and none of them are visible in the record text:
+
+- **External destination authorization** (RFC 9990 §4, and RFC 9991 §5 for
+  `ruf=`). Pass `policyDomain` and this library will at least tell you a
+  destination needs one and give you the name to check; it can never tell you
+  whether the record exists. See the usage section above.
+- **Whether the DKIM and SPF the record depends on are correct.** A flawless
+  `p=reject` record in front of a broken DKIM signature is worse than no record
+  at all.
+- **The tree walk's actual result** — which Organizational Domain a name
+  resolves to, and therefore which record applies and whether `sp=`/`np=` come
+  into play, is a DNS question (RFC 9989 §4.10).
+- **Whether more than one DMARC record is published** at the name, which makes
+  all of them inert. That is a property of the DNS response, not of any single
+  record string.
 
 ### A worked example: `np=` and the DNSSEC gotcha
 

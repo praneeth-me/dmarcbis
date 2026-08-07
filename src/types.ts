@@ -51,6 +51,25 @@ export interface Diagnostic {
   message: string;
 }
 
+/**
+ * Optional context for validate(). Everything here is information the record
+ * text alone cannot supply, so every field is optional and every check that
+ * depends on one is skipped when it is absent — a record validated without
+ * options gets exactly the diagnostics it always did.
+ */
+export interface ValidateOptions {
+  /**
+   * The domain the record was published at — the name *under* `_dmarc.`, so
+   * "example.com" for a record found at `_dmarc.example.com`. Supplying it
+   * enables RFC 9990 §4's external-destination check on `rua`/`ruf`.
+   *
+   * Leading/trailing dots and case are normalized; a `_dmarc.` prefix is
+   * stripped if present, since that is how the name is usually copied out of
+   * `dig`.
+   */
+  policyDomain?: string;
+}
+
 /** One tag=value pair as it literally appeared in the record, before any
  * judgement is applied about whether that tag is valid, current, or even
  * real. Kept even for tags that turn out to be duplicates or unrecognised —

@@ -6,4 +6,10 @@
  */
 export { parse } from "./parse.ts";
 export { validate } from "./validate.ts";
-export type { Diagnostic, ParsedRecord, ParsedTagEntry, Severity } from "./types.ts";
+export type {
+  Diagnostic,
+  ParsedRecord,
+  ParsedTagEntry,
+  Severity,
+  ValidateOptions,
+} from "./types.ts";
