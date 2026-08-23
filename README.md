@@ -242,8 +242,10 @@ This repository is a **mirror**. The library is developed inside the
 `git subtree split`, so every push replaces this repo's history wholesale.
 
 A pull request opened here can't be merged as-is — it would be overwritten on
-the next publish. Open an issue instead, or send a patch in one and it'll be
-applied upstream with attribution.
+the next publish. Open an issue for a bug or a case the library gets wrong.
+A patch attached to the issue is the most reliable way to send a fix — there's
+no tooling on this side to preserve a PR branch across a mirror push, so it
+may sit until it's applied upstream by hand.
 
 ## Project layout
 

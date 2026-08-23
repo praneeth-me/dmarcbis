@@ -148,7 +148,7 @@ situations got new codes, per this project's stability rule.
 
 ### Added
 
-- Regression tests for every item above (78 tests, up from 57), including a
+- Regression tests for every item above (89 tests, up from 57), including a
   5000-iteration deterministic fuzz over malformed input asserting that
   parse() never throws and every diagnostic is well-formed.
 - MIT `LICENSE`, `CONTRIBUTING.md` and `SECURITY.md`.

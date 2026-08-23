@@ -81,6 +81,11 @@ If you are changing what the library says about a tag, cite the section.
 
 ## Pull requests
 
+This repo is a mirror (see the README's "Development" section) — a PR merged
+here doesn't survive the next publish, since every push replaces the whole
+history. Open an issue first; if it turns into a patch, attach it there rather
+than opening a PR against this repo directly. The same bar applies either way:
+
 - One concern per PR.
 - Tests with the change, not after it.
 - `npm test` and `npm run typecheck` both clean.
